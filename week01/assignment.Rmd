@@ -1,0 +1,9 @@
+---
+title: "Week 01 Assignment"
+output: html_document
+---
+
+```{r}
+library(epiwraps)
+sessionInfo()
+```
