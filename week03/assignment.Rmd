@@ -1,0 +1,235 @@
+---
+title: "ChIP-seq assignment"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(GenomicRanges)
+library(rtracklayer)
+library(ggplot2)
+library(dplyr)
+```
+
+# Overview
+
+This report processes Drosophila CTCF ChIP-seq data from raw FASTQ and reports:
+
+1. number of mapped reads and mapping percentage  
+2. number of peaks found  
+3. one plot showing the signal around a peak located inside a gene  
+
+---
+
+# Input files
+
+```{r}
+fastq_file   <- "ENCFF127RRR.fastq.gz"
+bam_file     <- "ctcf.sorted.bam"
+flagstat_file <- "ctcf.flagstat.txt"
+peak_file    <- "ctcf_peaks.narrowPeak"
+gtf_file     <- "dmel-all-r6.57.gtf"   # replace with your own annotation file
+bedgraph_file <- "ctcf.signal.bedGraph" # optional, for plotting if available
+
+fastq_file
+bam_file
+flagstat_file
+peak_file
+gtf_file
+```
+
+# Processing commands
+
+The raw FASTQ was processed externally with a standard ChIP-seq workflow. Example commands are shown below.
+
+## 1. Download FASTQ
+
+```{bash eval=FALSE}
+curl -L -o ENCFF127RRR.fastq.gz \
+https://www.encodeproject.org/files/ENCFF127RRR/@@download/ENCFF127RRR.fastq.gz
+```
+
+## 2. Align reads to Drosophila genome
+
+```{bash eval=FALSE}
+curl -O https://hgdownload.soe.ucsc.edu/goldenPath/dm6/bigZips/dm6.fa.gz
+gunzip dm6.fa.gz
+bowtie2-build dm6.fa dm6_index
+bowtie2 -x dm6_index -U ENCFF127RRR.fastq.gz -S ctcf.sam
+samtools view -bS ctcf.sam > ctcf.bam
+samtools sort ctcf.bam -o ctcf.sorted.bam
+samtools index ctcf.sorted.bam
+samtools flagstat ctcf.sorted.bam > ctcf.flagstat.txt
+```
+
+## 3. Peak calling
+
+```{bash}
+macs2 callpeak \
+-t ctcf.sorted.bam \
+-f BAM \
+-g dm \
+-n ctcf
+```
+
+## 4. Optional signal track for plotting
+
+```{bash eval=FALSE}
+bedtools genomecov -ibam ctcf.sorted.bam -bg > ctcf.signal.bedGraph
+```
+
+---
+
+# 1. Mapping statistics
+
+```{r}
+flagstat_lines <- readLines(flagstat_file)
+
+mapped_line <- flagstat_lines[grepl(" mapped \\(", flagstat_lines)][1]
+mapped_line
+```
+
+```{r}
+# Extract mapped reads and percentage from samtools flagstat output
+mapped_reads <- sub("^([0-9]+) \\+ [0-9]+ mapped .*", "\\1", mapped_line)
+mapped_pct   <- sub("^.*\\(([0-9.]+)%.*\\)$", "\\1", mapped_line)
+
+mapped_reads <- as.numeric(mapped_reads)
+mapped_pct   <- as.numeric(mapped_pct)
+
+mapped_reads
+mapped_pct
+```
+
+**Mapped reads:** `r format(mapped_reads, big.mark=",")`  
+**Mapping percentage:** `r mapped_pct`%
+
+---
+
+# 2. Number of peaks found
+
+```{r}
+peaks <- read.table(peak_file, sep = "\t", header = FALSE, stringsAsFactors = FALSE)
+n_peaks <- nrow(peaks)
+n_peaks
+```
+
+**Number of peaks found:** `r format(n_peaks, big.mark=",")`
+
+---
+
+# 3. Find a peak located inside a gene
+
+The narrowPeak format has at least the first 3 genomic columns: chromosome, start, end.
+
+```{r}
+peak_gr <- GRanges(
+  seqnames = peaks[[1]],
+  ranges = IRanges(start = peaks[[2]] + 1, end = peaks[[3]])
+)
+```
+
+```{r}
+library(rtracklayer)
+library(GenomicRanges)
+
+gtf <- import("../dm6.refGene.gtf")
+peak_gr <- rtracklayer::import("ctcf_peaks.narrowPeak", format = "narrowPeak")
+
+genes_gr <- gtf[mcols(gtf)$type == "transcript"]
+
+hits <- findOverlaps(peak_gr, genes_gr)
+
+if (length(hits) == 0) stop("No peak overlapping transcript regions found.")
+
+peak_in_gene_idx <- queryHits(hits)[1]
+gene_idx <- subjectHits(hits)[1]
+
+selected_peak <- peak_gr[peak_in_gene_idx]
+selected_gene <- genes_gr[gene_idx]
+
+selected_peak
+selected_gene
+```
+
+```{r}
+gene_name <- NA
+if ("gene_name" %in% names(mcols(selected_gene))) {
+  gene_name <- mcols(selected_gene)$gene_name
+} else if ("gene_id" %in% names(mcols(selected_gene))) {
+  gene_name <- mcols(selected_gene)$gene_id
+}
+gene_name
+```
+
+Chosen peak is inside gene: `r as.character(gene_name)`
+
+---
+
+# 4. Plot signal around the selected intragenic peak
+
+This section uses a bedGraph signal track if available.
+
+```{r}
+signal <- read.table(
+  bedgraph_file,
+  sep = "\t",
+  header = FALSE,
+  stringsAsFactors = FALSE,
+  col.names = c("chr", "start", "end", "score")
+)
+
+head(signal)
+```
+
+```{r}
+peak_chr <- as.character(seqnames(selected_peak))
+peak_center <- round((start(selected_peak) + end(selected_peak)) / 2)
+
+window_start <- peak_center - 1000
+window_end   <- peak_center + 1000
+
+plot_df <- signal %>%
+  filter(chr == peak_chr,
+         end >= window_start,
+         start <= window_end) %>%
+  mutate(mid = (start + end) / 2,
+         rel_pos = mid - peak_center)
+
+head(plot_df)
+```
+
+```{r fig.width=8, fig.height=4}
+ggplot(plot_df, aes(x = rel_pos, y = score)) +
+  geom_line() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = paste("CTCF signal around intragenic peak in", gene_name),
+    x = "Position relative to peak center (bp)",
+    y = "Signal"
+  ) +
+  theme_bw()
+```
+
+---
+
+# Final report summary
+
+```{r}
+summary_df <- data.frame(
+  metric = c("Mapped reads", "Mapping percentage", "Peaks found"),
+  value = c(
+    format(mapped_reads, big.mark = ","),
+    paste0(mapped_pct, "%"),
+    format(n_peaks, big.mark = ",")
+  )
+)
+
+summary_df
+```
+
+**Mapped reads:** `r format(mapped_reads, big.mark=",")`  
+**Mapping percentage:** `r mapped_pct`%  
+**Peaks found:** `r format(n_peaks, big.mark=",")`  
+
+The figure above shows the signal around one peak located inside a gene.
