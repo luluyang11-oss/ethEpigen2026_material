@@ -1,0 +1,182 @@
+---
+title: "assignment"
+author: "Lulu"
+date: "2026-03-25"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(GenomicRanges)
+  library(SummarizedExperiment)
+  library(edgeR) # differential gene expression using neg.bin stats
+  library(pheatmap)
+  library(dplyr)
+  library(tibble) # for plotting (features*samples) heatmaps
+})
+```
+
+## Downloading the data
+
+
+```{r load_data}
+url <- "https://ethz-ins.org/content/mouse_mm38_hippocampus.peakCounts.SE.rds"
+dest <- "mouse_mm38_hippocampus.peakCounts.SE.rds"
+
+if (!file.exists(dest)) {
+  download.file(url, dest, mode = "wb")
+}
+
+se <- readRDS(dest)
+```
+
+```{r}
+dim(se)
+assay_names <- assayNames(se)
+assay_names
+
+# Usually the count matrix is in the first assay
+counts <- assay(se)
+
+# Sample metadata
+cd <- as.data.frame(colData(se))
+colnames(cd)
+head(cd)
+```
+
+```{r}
+# CHANGE THESE if needed after inspecting colData(se)
+sample_names <- colnames(counts)
+
+cd$condition <- sub("_.*", "", sample_names)
+cd$sex <- sub("^[^_]+_([^_]+)_.*", "\\1", sample_names)
+
+stress_col <- "condition"
+sex_col <- "sex"
+
+head(cd)
+stress_col
+sex_col
+```
+
+```{r}
+stopifnot(!is.null(stress_col), !is.null(sex_col))
+
+# Make factors
+cd[[stress_col]] <- factor(cd[[stress_col]])
+cd[[sex_col]] <- factor(cd[[sex_col]])
+
+# Check levels
+levels(cd[[stress_col]])
+levels(cd[[sex_col]])
+
+y <- DGEList(counts = counts, samples = cd)
+
+# Default normalization requested in the assignment
+y <- calcNormFactors(y, method = "TMM")
+```
+
+```{r}
+# stress comparison: FSS vs Control
+
+control_level <- "Control"
+
+cd$stress2 <- relevel(cd[[stress_col]], ref = control_level)
+
+design_stress <- model.matrix(~ stress2, data = cd)
+design_stress
+
+y_stress <- estimateDisp(y, design_stress)
+fit_stress <- glmQLFit(y_stress, design_stress)
+
+qlf_stress <- glmQLFTest(fit_stress, coef = 2)
+
+res_stress <- topTags(qlf_stress, n = Inf)$table
+res_stress <- tibble::rownames_to_column(res_stress, "peak_id")
+
+top10_stress <- res_stress %>%
+  arrange(PValue) %>%
+  slice(1:10)
+
+top10_stress
+```
+```{r}
+logcpm <- cpm(y, log = TRUE, prior.count = 1)
+
+mat_stress <- logcpm[top10_stress$peak_id, , drop = FALSE]
+
+anno_col_stress <- cd[, c(stress_col, sex_col), drop = FALSE]
+rownames(anno_col_stress) <- colnames(mat_stress)
+
+pheatmap(
+  mat_stress,
+  scale = "row",
+  annotation_col = anno_col_stress,
+  main = "Top 10 stress-associated regions"
+)
+```
+
+```{r}
+# set reference levels manually
+female_level <- "female"
+male_level <- "male"
+
+# make sure they are factors
+cd[[sex_col]] <- factor(cd[[sex_col]])
+cd[[stress_col]] <- factor(cd[[stress_col]])
+
+# relevel so female is baseline
+cd$sex2 <- relevel(cd[[sex_col]], ref = female_level)
+
+# design matrix
+design_sex <- model.matrix(~ sex2, data = cd)
+design_sex
+
+# edgeR differential analysis
+y_sex <- estimateDisp(y, design_sex)
+fit_sex <- glmQLFit(y_sex, design_sex)
+
+# test male vs female (coef 2)
+qlf_sex <- glmQLFTest(fit_sex, coef = 2)
+
+# extract results
+res_sex <- topTags(qlf_sex, n = Inf)$table
+res_sex <- tibble::rownames_to_column(res_sex, "peak_id")
+
+head(res_sex)
+```
+
+```{r}
+top10_sex <- res_sex %>%
+  arrange(PValue) %>%
+  slice(1:10)
+
+top10_sex
+```
+
+```{r}
+logcpm_sex <- cpm(y, log = TRUE, prior.count = 1)
+mat_sex <- logcpm_sex[top10_sex$peak_id, , drop = FALSE]
+
+anno_col_sex <- cd[, c(stress_col, sex_col), drop = FALSE]
+rownames(anno_col_sex) <- colnames(mat_sex)
+
+pheatmap(
+  mat_sex,
+  scale = "row",
+  annotation_col = anno_col_sex,
+  main = "Top 10 sex-associated regions"
+)
+```
+
+```{r}
+cat("Stress comparison top peak:\n")
+print(top10_stress[1, ])
+
+cat("\nSex comparison top peak:\n")
+print(top10_sex[1, ])
+```
+
+```{r}
+sessionInfo()
+```
