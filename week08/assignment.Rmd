@@ -1,0 +1,469 @@
+---
+title: "Week 08 Assignment"
+author: "Lulu Yang"
+output: html_document
+pdf_document: default
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(ggplot2)
+  library(dplyr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(rtracklayer)
+  library(bsseq)
+})
+```
+
+```{r, download, eval=FALSE}
+options(timeout = 6000)
+
+if (!dir.exists("comparison")) {
+  download.file(
+    "https://ethz-ins.org/content/w11_practical.zip",
+    destfile = "w11_practical.zip",
+    mode = "wb"
+  )
+  
+  unzip("w11_practical.zip")
+}
+
+list.files("comparison")
+```
+
+```{r}
+DNAme <- readRDS("comparison/DNAme.rds")
+
+DNAme
+class(DNAme)
+colnames(mcols(DNAme))
+head(as.data.frame(mcols(DNAme)))
+```
+
+```{r}
+DNAme_meta <- as.data.frame(mcols(DNAme))
+
+colnames(DNAme_meta)
+head(DNAme_meta)
+```
+
+```{r}
+# Find numeric methylation columns
+num_cols <- names(DNAme_meta)[sapply(DNAme_meta, is.numeric)]
+num_cols
+```
+
+```{r create-methylation-difference}
+# Inspect DNAme columns
+DNAme_meta <- as.data.frame(mcols(DNAme))
+
+colnames(DNAme_meta)
+head(DNAme_meta)
+
+# Find numeric columns
+num_cols <- names(DNAme_meta)[sapply(DNAme_meta, is.numeric)]
+num_cols
+
+# Try to detect ESC and Astro columns
+esc_col <- grep("ESC|esc", colnames(DNAme_meta), value = TRUE)
+astro_col <- grep("Astro|astro|ASTRO", colnames(DNAme_meta), value = TRUE)
+
+esc_col
+astro_col
+
+# If ESC and Astro columns exist, calculate methylation difference
+if (length(esc_col) >= 1 && length(astro_col) >= 1) {
+  
+  esc_col <- esc_col[1]
+  astro_col <- astro_col[1]
+  
+  DNAme$meth_diff <- as.numeric(mcols(DNAme)[[astro_col]]) -
+    as.numeric(mcols(DNAme)[[esc_col]])
+  
+} else {
+  
+  # If DNAme only has one score column, use score as methylation signal
+  # This is not a true Astro - ESC difference, but it avoids the error.
+  message("No separate ESC/Astro columns found. Using 'score' as methylation signal.")
+  
+  if ("score" %in% colnames(DNAme_meta)) {
+    DNAme$meth_diff <- as.numeric(DNAme$score)
+  } else {
+    DNAme$meth_diff <- as.numeric(mcols(DNAme)[[num_cols[1]]])
+  }
+  
+  esc_col <- "score"
+  astro_col <- "score"
+}
+
+summary(DNAme$meth_diff)
+```
+
+```{r select-top5-dmr-chr1}
+
+# Keep only chromosome 1
+
+dmr_chr1 <- DNAme[seqnames(DNAme) == "chr1"]
+
+if (length(dmr_chr1) == 0) {
+
+  dmr_chr1 <- DNAme[seqnames(DNAme) == "1"]
+
+}
+
+length(dmr_chr1)
+
+# Remove NA scores
+
+dmr_chr1 <- dmr_chr1[!is.na(dmr_chr1$score)]
+
+# Select 5 regions with high but non-identical methylation scores
+
+dmr_chr1_ordered <- dmr_chr1[order(dmr_chr1$score, decreasing = TRUE)]
+
+# To avoid selecting five identical 100 values, take representative scores
+
+top5_indices <- round(seq(1, length(dmr_chr1_ordered), length.out = 5))
+
+top5_dmr_chr1 <- dmr_chr1_ordered[top5_indices]
+
+top5_dmr_chr1
+```
+
+```{r generate-heatmap-matrix}
+# Create heatmap matrix from top5_dmr_chr1
+
+DNAme_meta_top5 <- as.data.frame(mcols(top5_dmr_chr1))
+
+meth_mat <- as.matrix(DNAme_meta_top5[, "score", drop = FALSE])
+
+colnames(meth_mat) <- "DNA methylation score"
+
+rownames(meth_mat) <- paste0(
+  as.character(seqnames(top5_dmr_chr1)),
+  ":",
+  start(top5_dmr_chr1),
+  "-",
+  end(top5_dmr_chr1)
+)
+
+meth_mat
+```
+Then your heatmap chunk should be:
+
+
+```{r heatmap-top5-dmr, fig.width=6, fig.height=5}
+# Safe color scale for heatmap
+
+meth_min <- min(meth_mat, na.rm = TRUE)
+meth_max <- max(meth_mat, na.rm = TRUE)
+
+if (meth_min == meth_max) {
+  col_fun <- colorRamp2(
+    c(meth_min - 1, meth_min, meth_min + 1),
+    c("blue", "white", "red")
+  )
+} else {
+  col_fun <- colorRamp2(
+    c(meth_min, mean(c(meth_min, meth_max)), meth_max),
+    c("blue", "white", "red")
+  )
+}
+
+Heatmap(
+  meth_mat,
+  name = "DNA methylation",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_title = "Top 5 chr1 methylation regions",
+  column_title = "Methylation signal"
+)
+```
+
+```{r load-and-prepare-atac}
+
+# Load differential ATAC-seq data
+
+ATAC_diff <- readRDS(
+
+  url("https://www.ethz-ins.org/content/ATAC_AstroVsESC_subset.rds")
+
+)
+
+ATAC_diff
+
+class(ATAC_diff)
+
+# Prepare ATAC GRanges object
+
+if (inherits(ATAC_diff, "GRanges")) {
+
+  
+
+  atac_gr <- ATAC_diff
+
+  
+
+} else if (is.data.frame(ATAC_diff)) {
+
+  
+
+  atac_df <- ATAC_diff
+
+  atac_cols <- colnames(atac_df)
+
+  
+
+  if (all(c("seqnames", "start", "end") %in% atac_cols)) {
+
+    atac_gr <- GRanges(
+
+      seqnames = atac_df$seqnames,
+
+      ranges = IRanges(start = atac_df$start, end = atac_df$end),
+
+      atac_df
+
+    )
+
+  } else if (all(c("chr", "start", "end") %in% atac_cols)) {
+
+    atac_gr <- GRanges(
+
+      seqnames = atac_df$chr,
+
+      ranges = IRanges(start = atac_df$start, end = atac_df$end),
+
+      atac_df
+
+    )
+
+  } else if (all(c("Chromosome", "Start", "End") %in% atac_cols)) {
+
+    atac_gr <- GRanges(
+
+      seqnames = atac_df$Chromosome,
+
+      ranges = IRanges(start = atac_df$Start, end = atac_df$End),
+
+      atac_df
+
+    )
+
+  } else {
+
+    stop("Could not convert ATAC_diff to GRanges. Please check colnames(ATAC_diff).")
+
+  }
+
+  
+
+} else {
+
+  stop("ATAC_diff is not GRanges or data.frame.")
+
+}
+
+atac_gr
+
+colnames(mcols(atac_gr))
+```
+
+```{r overlap-dmr-atac}
+
+# Make chromosome naming consistent between DNAme and ATAC regions
+
+seqlevelsStyle(DNAme) <- seqlevelsStyle(atac_gr)[1]
+
+# Find overlaps
+
+hits <- findOverlaps(DNAme, atac_gr)
+
+length(hits)
+
+DNAme_overlap <- DNAme[queryHits(hits)]
+
+ATAC_overlap <- atac_gr[subjectHits(hits)]
+
+DNAme_overlap
+
+ATAC_overlap
+```
+
+```{r identify-methylation-difference-column}
+# ------------------------------------------------------------
+# Identify methylation difference column
+# ------------------------------------------------------------
+
+DNAme_cols <- colnames(mcols(DNAme_overlap))
+DNAme_cols
+
+if ("meth_diff" %in% DNAme_cols) {
+  meth_diff <- mcols(DNAme_overlap)$meth_diff
+} else if ("meth.diff" %in% DNAme_cols) {
+  meth_diff <- mcols(DNAme_overlap)$meth.diff
+} else if ("diff.Methy" %in% DNAme_cols) {
+  meth_diff <- mcols(DNAme_overlap)$diff.Methy
+} else if ("diffMeth" %in% DNAme_cols) {
+  meth_diff <- mcols(DNAme_overlap)$diffMeth
+} else if ("meanDiff" %in% DNAme_cols) {
+  meth_diff <- mcols(DNAme_overlap)$meanDiff
+} else if ("score" %in% DNAme_cols) {
+  meth_diff <- mcols(DNAme_overlap)$score
+} else {
+  stop("Cannot find methylation difference column. Check colnames(mcols(DNAme_overlap)).")
+}
+
+summary(meth_diff)
+```
+
+
+```{r identify-atac-change-column}
+# ------------------------------------------------------------
+# Identify ATAC accessibility change column
+# ------------------------------------------------------------
+
+ATAC_cols <- colnames(mcols(ATAC_overlap))
+ATAC_cols
+
+if ("logFC" %in% ATAC_cols) {
+  atac_change <- mcols(ATAC_overlap)$logFC
+} else if ("log2FoldChange" %in% ATAC_cols) {
+  atac_change <- mcols(ATAC_overlap)$log2FoldChange
+} else if ("avg_log2FC" %in% ATAC_cols) {
+  atac_change <- mcols(ATAC_overlap)$avg_log2FC
+} else if ("diff" %in% ATAC_cols) {
+  atac_change <- mcols(ATAC_overlap)$diff
+} else if ("score" %in% ATAC_cols) {
+  atac_change <- mcols(ATAC_overlap)$score
+} else {
+  numeric_ATAC_cols <- ATAC_cols[
+    sapply(as.data.frame(mcols(ATAC_overlap)), is.numeric)
+  ]
+  
+  numeric_ATAC_cols
+  
+  atac_change <- mcols(ATAC_overlap)[[numeric_ATAC_cols[1]]]
+}
+
+summary(atac_change)
+```
+
+
+```{r}
+# ------------------------------------------------------------
+# Create comparison dataframe
+# ------------------------------------------------------------
+
+comparison_df <- data.frame(
+  meth_diff = as.numeric(meth_diff),
+  atac_change = as.numeric(atac_change)
+)
+
+comparison_df <- comparison_df[complete.cases(comparison_df), ]
+
+head(comparison_df)
+dim(comparison_df)
+```
+
+```{r}
+# ------------------------------------------------------------
+# Scatter plot: methylation change vs accessibility change
+# ------------------------------------------------------------
+
+ggplot(comparison_df, aes(x = meth_diff, y = atac_change)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_classic() +
+  labs(
+    title = "Comparison of DNA methylation and chromatin accessibility changes",
+    x = "DNA methylation difference",
+    y = "ATAC accessibility change"
+  )
+```
+
+```{r}
+# Correlation analysis
+# ------------------------------------------------------------
+
+cor_result <- cor.test(
+  comparison_df$meth_diff,
+  comparison_df$atac_change,
+  method = "spearman"
+)
+
+cor_result
+```
+
+```{r}
+# ------------------------------------------------------------
+# Classify agreement/disagreement
+# Agreement means inverse relationship:
+# increased methylation + decreased accessibility
+# decreased methylation + increased accessibility
+# ------------------------------------------------------------
+
+comparison_df$relationship <- case_when(
+  comparison_df$meth_diff > 0 & comparison_df$atac_change < 0 ~ "Concordant: hypermethylation + lower accessibility",
+  comparison_df$meth_diff < 0 & comparison_df$atac_change > 0 ~ "Concordant: hypomethylation + higher accessibility",
+  TRUE ~ "Discordant"
+)
+
+table(comparison_df$relationship)
+```
+
+```{r}
+# ------------------------------------------------------------
+# Plot with relationship categories
+# ------------------------------------------------------------
+
+ggplot(comparison_df, aes(x = meth_diff, y = atac_change, color = relationship)) +
+  geom_point(alpha = 0.7) +
+  theme_classic() +
+  labs(
+    title = "Agreement between methylation and accessibility changes",
+    x = "DNA methylation difference",
+    y = "ATAC accessibility change",
+    color = "Relationship"
+  )
+```
+
+```{r relationship-barplot, fig.width=7, fig.height=5}
+relationship_summary <- as.data.frame(table(comparison_df$relationship))
+
+colnames(relationship_summary) <- c("relationship", "n")
+
+relationship_summary
+
+ggplot(relationship_summary, aes(x = relationship, y = n, fill = relationship)) +
+  geom_col() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    title = "Number of concordant and discordant regions",
+    x = "",
+    y = "Number of overlapping regions"
+  )
+```
+ 
+```{r} 
+  rho <- round(cor_result$estimate, 3)
+pval <- signif(cor_result$p.value, 3)
+
+cat(
+  "I overlapped differentially methylated regions with differential ATAC-seq regions and compared methylation difference with accessibility change. ",
+  "The Spearman correlation coefficient was ", rho,
+  " with a p-value of ", pval,
+  ". Regions with increased methylation and decreased accessibility, or decreased methylation and increased accessibility, were considered concordant because DNA methylation is generally associated with reduced chromatin accessibility.",
+  sep = ""
+)
+  
+```
