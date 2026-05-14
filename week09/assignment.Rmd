@@ -1,0 +1,233 @@
+---
+title: "assignment"
+author: "Lulu"
+date: "2026-05-13"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(rtracklayer)
+library(GenomicRanges)
+library(pheatmap)
+library(ggplot2)
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(ChIPseeker)
+library(tidyr)
+```
+
+```{r download-data}
+# 1. Download and unzip only if the folder doesn't exist
+if (!dir.exists("clustering_assignment")) {
+  download.file(
+    url = "https://ethz-ins.org/content/clustering_assignment.zip",
+    destfile = "clustering_assignment.zip",
+    mode = "wb"
+  )
+  unzip("clustering_assignment.zip", exdir = "clustering_assignment")
+}
+```
+
+```{r read-peaks}
+# 4. Check files
+# R Markdown ignores setwd() across chunks, so we specify the folder directly
+peak_files <- list.files(path = "clustering_assignment", pattern = "\\.bed$", full.names = TRUE)
+
+peaks <- lapply(peak_files, rtracklayer::import)
+
+# Keep high-confidence peaks
+peaks_high <- lapply(peaks, function(x) {
+  x[x$score > 800]
+})
+
+# Create union of non-redundant regions
+regions <- reduce(unlist(GRangesList(peaks_high)))
+```
+
+```{r extract-signals}
+# Find bigWig files inside the subfolder
+bw_files <- list.files(
+  path = "clustering_assignment",
+  pattern = "\\.bw$|\\.bigWig$|\\.bigwig$",
+  full.names = TRUE,
+  recursive = TRUE,
+  ignore.case = TRUE
+)
+
+# Function to calculate average signal for each region
+get_bw_signal <- function(bw_file, regions) {
+  bw_signal <- rtracklayer::import(bw_file, which = regions, as = "NumericList")
+  signal <- sapply(bw_signal, function(x) {
+    if (length(x) == 0) {
+      return(0)
+    } else {
+      return(mean(x, na.rm = TRUE))
+    }
+  })
+  return(signal)
+}
+
+# Extract signal from all bigWig files
+signal_list <- lapply(bw_files, get_bw_signal, regions = regions)
+
+# Convert list to matrix
+signal_matrix <- do.call(cbind, signal_list)
+
+# Add column names
+colnames(signal_matrix) <- gsub(
+  "\\.bw$|\\.bigWig$|\\.bigwig$",
+  "",
+  basename(bw_files),
+  ignore.case = TRUE
+)
+
+# Replace NA with 0
+signal_matrix[is.na(signal_matrix)] <- 0
+```
+
+```{r filter-and-cluster}
+# Make numeric matrix
+signal_matrix <- as.data.frame(signal_matrix)
+
+signal_matrix[] <- lapply(signal_matrix, function(x) {
+  as.numeric(as.character(x))
+})
+
+signal_matrix <- as.matrix(signal_matrix)
+signal_matrix[is.na(signal_matrix)] <- 0
+
+# Keep only regions with signal
+keep_regions <- rowSums(signal_matrix) > 0
+
+if (sum(keep_regions) >= 2) {
+  
+  signal_matrix_filtered <- signal_matrix[keep_regions, , drop = FALSE]
+  regions_filtered <- regions[keep_regions]
+  
+  # Scale signal matrix
+  signal_scaled <- scale(signal_matrix_filtered)
+  
+  # Replace problematic values
+  signal_scaled[is.na(signal_scaled)] <- 0
+  signal_scaled[is.nan(signal_scaled)] <- 0
+  signal_scaled[is.infinite(signal_scaled)] <- 0
+  
+  # Check number of distinct signal patterns
+  n_distinct_patterns <- nrow(unique(signal_scaled))
+  
+  # Choose k safely
+  k <- min(4, n_distinct_patterns, nrow(signal_scaled))
+  
+  if (k >= 1) {
+    set.seed(123)
+    
+    clusters <- kmeans(
+      signal_scaled,
+      centers = k,
+      nstart = 25
+    )
+    
+    regions_filtered$cluster <- clusters$cluster
+  }
+  
+} else {
+  message("Not enough non-zero signal regions for k-means clustering.")
+  
+  # Use original matrix for heatmap instead
+  signal_scaled <- scale(signal_matrix)
+  signal_scaled[is.na(signal_scaled)] <- 0
+  signal_scaled[is.nan(signal_scaled)] <- 0
+  signal_scaled[is.infinite(signal_scaled)] <- 0
+  
+  regions_filtered <- regions
+}
+```
+
+```{r plot-heatmap}
+# pheatmap requires explicit rownames to map the annotation_row correctly
+rownames(signal_scaled) <- paste0("Region_", 1:nrow(signal_scaled))
+
+annotation_row <- data.frame(
+  Cluster = factor(clusters$cluster)
+)
+rownames(annotation_row) <- rownames(signal_scaled)
+
+pheatmap(
+  signal_scaled,
+  annotation_row = annotation_row,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = FALSE,
+  main = "Clustering of CREB-family transcription factor binding"
+)
+```
+
+```{r plot-average-signal}
+# Use filtered matrix and filtered regions to ensure dimensions match perfectly
+plot_df <- as.data.frame(signal_matrix_filtered)
+plot_df$cluster <- factor(regions_filtered$cluster)
+
+avg_df <- plot_df %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), mean))
+
+avg_long <- pivot_longer(
+  avg_df,
+  cols = -cluster,
+  names_to = "Factor",
+  values_to = "Average_signal"
+)
+
+ggplot(avg_long, aes(x = Factor, y = Average_signal, group = cluster, color = cluster)) +
+  geom_line() +
+  geom_point(size = 2) +
+  theme_bw() +
+  labs(
+    title = "Average binding signal across clusters",
+    x = "Transcription factor",
+    y = "Average bigWig signal"
+  )
+```
+
+```{r go-enrichment, message=FALSE, warning=FALSE}
+# Select one cluster, for example cluster 1
+cluster_regions <- regions_filtered[regions_filtered$cluster == 1]
+
+# Annotate regions to nearest genes
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+peak_anno <- annotatePeak(
+  cluster_regions,
+  TxDb = txdb,
+  tssRegion = c(-3000, 3000),
+  annoDb = "org.Hs.eg.db"
+)
+
+anno_df <- as.data.frame(peak_anno)
+
+genes <- unique(anno_df$geneId)
+genes <- genes[!is.na(genes)]
+
+ego <- enrichGO(
+  gene          = genes,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+dotplot(ego, showCategory = 10) +
+  ggtitle("GO enrichment for cluster 1")
+```
+
+## Discussion and Conclusion
+
+Using high-confidence peak regions on chromosome 1, I compared the binding profiles of three CREB-family transcription factors: CREB1, CREB3, and CREB3L1. The heatmap revealed both shared and distinct binding patterns across the selected genomic regions. Hierarchical clustering suggested that CREB1 and CREB3L1 have more similar binding profiles, whereas CREB3 showed a more distinct pattern.
+
+K-means clustering separated the genomic regions into four clusters. The average signal plot showed that each cluster was characterized by different transcription factor binding patterns. Cluster 2 showed relatively strong CREB1 signal, cluster 3 was dominated by CREB3 signal, and cluster 4 showed strong CREB3L1 signal. This suggests that although CREB-family transcription factors share part of their chromatin binding landscape, some genomic regions display factor-specific binding preferences.
+
+GO enrichment analysis of cluster 1 showed enrichment for biological processes related to RNA splicing, ribonucleoprotein complex biogenesis, protein-RNA complex assembly, spliceosomal complex assembly, and mRNA splice site recognition. These results suggest that genes associated with cluster 1 may be involved in RNA processing and post-transcriptional regulation. Overall, the analysis indicates that CREB-family transcription factors show both shared and differential binding patterns, and that at least one cluster is linked to RNA-processing-related functions.
