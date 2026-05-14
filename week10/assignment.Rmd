@@ -1,0 +1,220 @@
+---
+title: "assignment"
+author: "Lulu"
+date: "2026-05-19"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+
+library(GenomicRanges)
+library(rtracklayer)
+library(dplyr)
+library(ggplot2)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(org.Hs.eg.db)
+```
+
+```{r}
+# p300 peaks in A549 cells:
+download.file("https://www.encodeproject.org/files/ENCFF776TFX/@@download/ENCFF776TFX.bed.gz", "p300.narrowPeak.gz")
+# The rE2G file come from the SAME cell type as the p300 peak file.
+download.file(
+
+"https://www.encodeproject.org/files/ENCFF062OLP/@@download/ENCFF062OLP.bed.gz",
+
+"A549_rE2G_links.bed.gz",
+
+  ode = "wb"
+
+)
+
+```
+```{r}
+# Read A549 rE2G thresholded element-gene links
+re2g_df <- read.table(
+  "A549_rE2G_links.bed.gz",
+  header = TRUE,
+  sep = "\t",
+  quote = "",
+  comment.char = "",
+  stringsAsFactors = FALSE
+)
+
+# Rename first columns
+colnames(re2g_df)[1:4] <- c("chr", "start", "end", "name")
+
+# Check columns
+head(re2g_df)
+colnames(re2g_df)
+```
+```{r}
+library(GenomicRanges)
+
+re2g_gr <- GRanges(
+  seqnames = re2g_df$chr,
+  ranges = IRanges(
+    start = re2g_df$start,
+    end = re2g_df$end
+  )
+)
+
+mcols(re2g_gr) <- re2g_df[, 4:ncol(re2g_df)]
+
+re2g_gr
+```
+
+```{r}
+library(rtracklayer)
+
+p300_peaks <- import("p300.narrowPeak.gz")
+
+p300_peaks
+head(as.data.frame(p300_peaks))
+```
+
+```{r}
+hits <- findOverlaps(p300_peaks, re2g_gr)
+
+p300_overlap <- p300_peaks[queryHits(hits)]
+re2g_overlap <- re2g_gr[subjectHits(hits)]
+
+length(p300_peaks)
+length(p300_overlap)
+```
+
+```{r}
+data.frame(
+
+  column_number = seq_along(colnames(re2g_df)),
+
+  column_name = colnames(re2g_df)
+
+)
+```
+
+```{r}
+p300_overlap$predicted_target <- re2g_overlap$TargetGene
+p300_overlap$TargetGeneTSS <- re2g_overlap$TargetGeneTSS
+
+head(as.data.frame(p300_overlap))
+```
+
+```{r}
+p300_overlap <- p300_overlap[!is.na(p300_overlap$predicted_target)]
+
+length(p300_overlap)
+```
+
+```{r}
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(GenomicRanges)
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+# Get gene annotation
+genes_gr <- genes(txdb)
+
+# Convert each gene to its TSS position
+tss_gr <- resize(
+  genes_gr,
+  width = 1,
+  fix = "start"
+)
+
+# Find nearest TSS for each p300 peak
+nearest_tss_idx <- nearest(p300_overlap, tss_gr)
+
+nearest_tss <- tss_gr[nearest_tss_idx]
+
+# Add nearest gene Entrez ID
+p300_overlap$nearest_entrez <- nearest_tss$gene_id
+
+# Convert Entrez ID to gene symbol
+p300_overlap$nearest_gene <- mapIds(
+  org.Hs.eg.db,
+  keys = as.character(p300_overlap$nearest_entrez),
+  column = "SYMBOL",
+  keytype = "ENTREZID",
+  multiVals = "first"
+)
+
+# Add nearest TSS coordinate
+p300_overlap$nearest_TSS_chr <- as.character(seqnames(nearest_tss))
+p300_overlap$nearest_TSS <- start(nearest_tss)
+
+head(as.data.frame(p300_overlap)[, c(
+  "seqnames", "start", "end",
+  "predicted_target",
+  "TargetGeneTSS",
+  "nearest_gene",
+  "nearest_TSS"
+)])
+```
+
+```{r}
+library(dplyr)
+
+result_df <- as.data.frame(p300_overlap)
+
+result_df <- result_df %>%
+  mutate(
+    predicted_target = as.character(predicted_target),
+    nearest_gene = as.character(nearest_gene),
+    predicted_is_nearest = predicted_target == nearest_gene
+  )
+
+head(result_df[, c("predicted_target", "nearest_gene", "predicted_is_nearest")])
+```
+
+```{r}
+overall_result <- result_df %>%
+  summarise(
+    n = n(),
+    predicted_is_nearest_n = sum(predicted_is_nearest, na.rm = TRUE),
+    proportion_predicted_is_nearest = mean(predicted_is_nearest, na.rm = TRUE)
+  )
+
+overall_result
+```
+
+```{r}
+result_df <- result_df %>%
+  mutate(
+    peak_center = round((start + end) / 2),
+    TargetGeneTSS = as.numeric(TargetGeneTSS),
+    distance_to_predicted_TSS = peak_center - TargetGeneTSS,
+    direction = ifelse(distance_to_predicted_TSS < 0, "Upstream", "Downstream")
+  )
+
+head(result_df[, c("predicted_target", "TargetGeneTSS", "peak_center", "distance_to_predicted_TSS", "direction")])
+```
+
+```{r}
+prop_by_direction <- result_df %>%
+  group_by(direction) %>%
+  summarise(
+    n = n(),
+    predicted_is_nearest_n = sum(predicted_is_nearest, na.rm = TRUE),
+    proportion_predicted_is_nearest = mean(predicted_is_nearest, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+prop_by_direction
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(result_df, aes(x = distance_to_predicted_TSS / 1000, fill = direction)) +
+  geom_histogram(bins = 60, alpha = 0.7) +
+  theme_bw() +
+  labs(
+    title = "Distance between p300 peaks and rE2G-predicted target TSS",
+    x = "Distance to predicted target TSS (kb)",
+    y = "Number of p300 peaks"
+  )
+```
